@@ -1,0 +1,91 @@
+# vim: set syntax=ytest
+
+# comment
+
+
+STOP_SERVER = ''
+START_SERVER = ''
+RELOAD_SERVER = ''
+ENDPOINT = '127.0.0.1:8888'
+
+=== Test1: put file
+
+--- setup
+---request
+
+POST /bucket1/test.png HTTP/1.1
+Host: v0.api.upyun.com
+Content-Length: 5
+
+abcde
+
+--- response
+HTTP/1.1 200 OK
+
+---response_body
+
+abcde
+
+
+
+
+=== Test2: put file
+
+
+--- setup
+---request
+
+POST /bucket1/test.png HTTP/1.1
+Host: v0.api.upyun.com
+Content-Length: 5
+
+abcde
+
+--- response
+HTTP/1.1 200 OK
+
+---response_body
+
+abcde
+
+
+
+=== Test3: put file
+
+
+--- setup
+---request
+
+POST /bucket1/test.png HTTP/1.1
+Host: v0.api.upyun.com
+Content-Length: 5
+
+abcde
+
+--- response
+HTTP/1.1 200 OK
+
+---response_body
+
+abcde
+
+
+
+=== Test4: put file
+
+--- setup
+---request
+
+POST /bucket1/test.png HTTP/1.1
+Host: v0.api.upyun.com
+Content-Length: 5
+
+abcde
+
+--- response
+HTTP/1.1 200 OK
+
+---response_body
+
+abcde
+
