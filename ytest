@@ -8,8 +8,10 @@ import sys
 import os
 import re
 import copy
-import socket
-import time
+import random
+import httplib
+import sre_constants
+from collections import defaultdict
 from optparse import OptionParser
 
 
@@ -46,15 +48,17 @@ def http_wrap(s, unused):
 
 
 def http_strip_body(s, unused):
-    parts = s.split('\r\n')
-    i = next((i for i, v in enumerate(parts) if v == ''), len(parts))
-    return parts[:i]
+    sep = s.find('\r\n\r\n')
+    if sep > 0:
+        s = s[:sep]
+    return s.split('\r\n')
 
 
 def http_strip_header(s, unused):
-    parts = s.split('\r\n')
-    i = next((i for i, v in enumerate(parts) if v == ''), len(parts))
-    return ''.join(parts[i+1:])
+    sep = s.find('\r\n\r\n')
+    if not sep:
+        return s
+    return s[sep+4:]
 
 
 def python_exec(s, e):
@@ -63,12 +67,15 @@ def python_exec(s, e):
 
 
 class Block(object):
+    EVAL_RE = re.compile('{{(.+?)}}')
+
     FILTERS = {
         'http': http_wrap,
         'http_strip_body': http_strip_body,
         'http_strip_header': http_strip_header,
         'python': python_exec,
     }
+
     DEFAULT_FILTER = {
         'request': 'http',
         'response': 'http_strip_body',
@@ -94,11 +101,15 @@ class Block(object):
             i += 1
         while i <= j and lines[j].strip() == '':
             j -= 1
-        self.lines = [l.rstrip() for l in lines[i:j+1]]
+
+        self.raw_lines = [l.rstrip() for l in lines[i:j+1]]
+        if self.raw_lines and self.raw_lines[-1] == '__EOF__':
+            self.raw_lines[-1] = ''
 
     def __str__(self):
         if self.filters:
-            return '<Block, name=%s, filters=%s>' % (self.name, '|'.join(self.filters))
+            return '<Block, name=%s, filters=%s>' % \
+                    (self.name, '|'.join(self.filters))
         return '<Block, name=%s>' % (self.name)
 
     def __repr__(self):
@@ -106,10 +117,24 @@ class Block(object):
 
     @property
     def raw_content(self):
-        return '\n'.join(self.lines)
+        return '\n'.join(self.raw_lines)
+
+    def lines(self, env):
+        t = [self.EVAL_RE.sub(
+                    lambda m: str(eval(m.groups()[0], None, env)),
+                    l) for l in self.raw_lines]
+        return t
+
+    def content(self, env):
+        return self.EVAL_RE.sub(
+                    lambda m: str(eval(m.groups()[0], None, env)),
+                    self.raw_content)
 
     def filter(self, env, raw_content=None):
         content = self.raw_content if raw_content is None else raw_content
+        content = self.EVAL_RE.sub(
+                    lambda m: str(eval(m.groups()[0], None, env)),
+                    content)
         for flt in self.filters:
             if flt == 'raw':
                 continue
@@ -124,6 +149,8 @@ class Block(object):
 
 
 class Case(object):
+    SERIES_PAT = re.compile('Test *(\w+)\.\w+ *:')
+
     def __init__(self, name):
         self.name = name
         self.blocks = {}
@@ -139,6 +166,12 @@ class Case(object):
 
     def __repr__(self):
         return self.__str__()
+
+    @property
+    def series(self):
+        se = self.SERIES_PAT.findall(self.name)
+        if se:
+            return se[0]
 
 
 def parse_file(fpath):
@@ -164,6 +197,7 @@ def parse_file(fpath):
                     if block_head:
                         block = Block(block_head, block_lines)
                         case.set_block(block)
+                        block_head = None
                     cases.append(case)
                 case = Case(line[3:].strip())
                 st = st_case
@@ -234,28 +268,24 @@ def gather_cases(test_files, filter=None):
 
 class Server(object):
 
-    STOP_SRV = 'nginx/sbin/nginx -s stop > /dev/null 2>&1 || ps aux | grep nginx | grep -v grep | awk \'{print $2}\' | xargs kill -9 > /dev/null 2>&1'
-    START_SRV = 'nginx/sbin/nginx 1> /dev/null'
-    RELOAD_SRV = 'nginx/sbin/nginx -s reload 1> /dev/null'
-    LOG_PATH = 'nginx/logs/error.log'
     ERR_PAT = '.+\[error\]'
     WARN_PAT = '.+\[warn\]'
 
     def __init__(self, env):
         self.env = env
-        self.log_path = env.get('LOG_PATH', self.LOG_PATH)
+        self.log_path = env.get('LOG_PATH', '')
 
     def stop(self):
-        os.system(self.env.get('STOP_SERVER', self.STOP_SRV))
+        os.system(self.env.get('STOP_SERVER', ''))
 
     def start(self):
         self.stop()
-        os.system(self.env.get('START_SERVER', self.START_SRV))
-        if os.path.exists(self.log_path):
+        os.system(self.env.get('START_SERVER', ''))
+        if self.log_path and os.path.exists(self.log_path):
             os.system('> %s' % self.log_path)
 
     def reload(self):
-        os.system(self.env.get('RELOAD_SERVER', self.RELOAD_SRV))
+        os.system(self.env.get('RELOAD_SERVER', ''))
 
     def grep_log(self, level='error'):
         pat = re.compile(self.ERR_PAT if level == 'error' else self.WARN_PAT)
@@ -265,28 +295,43 @@ class Server(object):
         return logs
 
 
-def send_request(endpoint, body, max_body=1024*1024, timeout=5):
+def do_http_request(endpoint, body, timeout=5):
     host, port = endpoint.split(':') if ':' in endpoint else (endpoint, 80)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    sock.connect((host, int(port)))
-    sock.send(body)
-    resp = sock.recv(max_body)
-    sock.close()
-    return resp
+    conn = httplib.HTTPConnection(host, port, timeout=timeout)
+    conn.send(body)
+    # XXX I really don't want to set private member like this,
+    # however, I have no other idea how to getresponse after send
+    # directly from socket.
+    conn._HTTPConnection__state = 'Request-sent'
+    resp = conn.getresponse()
+    line = 'HTTP/1.%s %s %s' % (resp.version % 10, resp.status, resp.reason)
+    data = [line]
+    headers = ('%s: %s' % (k.title(), v) for k, v in resp.getheaders())
+    data.extend(headers)
+    data.append('')
+    body = resp.read()
+    conn.close()
+    if body:
+        data.append(body)
+    return '\r\n'.join(data)
 
 
 def run_case(env, case):
     srv = Server(env)
     not_match = lambda exp, got: 'expect %r but got %r' % (exp, got)
-    def _check_log(level):
-        blk = case.get_block(level)
-        if not blk:
-            return
-        lines = [l for l in blk.lines if l.strip()]
+    def _check_log(level, force=False):
+        err_prefix = 'grep %s failed, ' % level
+
         log_lines = srv.grep_log(level=level)
 
-        err_prefix = 'grep %s failed, ' % level
+        blk = case.get_block(level)
+        if not blk:
+            if force and log_lines:
+                return err_prefix + not_match([], log_lines)
+            return
+
+        lines = [l for l in blk.lines(env) if l.strip()]
+
         if len(lines) != len(log_lines):
             return err_prefix + not_match(lines, log_lines)
         for idx, line in enumerate(lines):
@@ -305,47 +350,105 @@ def run_case(env, case):
     if request_blk:
         content = request_blk.filter(env)
         endpoint = env.get('ENDPOINT', '127.0.0.1')
-        resp = send_request(endpoint, content)
+
+        resp = do_http_request(endpoint, content)
+
+        if env.get('DEBUG', False):
+            info('request %s' % ('-' * 50))
+            info(content)
+            info('response %s' % ('-' * 50))
+            info(resp)
 
         response_blk = case.get_block('response')
         if response_blk:
-            expect = [l.strip() for l in response_blk.lines]
+            expect = [l.strip() for l in response_blk.lines(env)]
+            if env.get('DEBUG', False):
+                info('expect %s' % ('-' * 50))
+                info('\n'.join(expect))
+
             got = response_blk.filter(env, resp)
+
             for line in expect:
                 if line in got:
                     continue
                 # if not in got, try re
-                pat = re.compile('^%s$' % line)
-                if any(l for l in got if pat.match(l)):
-                    continue
+                try:
+                    pat = re.compile('^%s$' % line)
+                    if any(l for l in got if pat.match(l)):
+                        continue
+                except sre_constants.error:
+                    pass
                 if teardown_blk:
                     teardown_blk.filter(env)
                 srv.stop()
-                return not_match('\n'.join(expect), got)
+                return not_match('\n'.join(expect), '\n'.join(got))
         response_body_blk = case.get_block('response_body')
         if response_body_blk:
-            expect = response_body_blk.raw_content
+            expect = response_body_blk.content(env)
             got = response_body_blk.filter(env, resp)
             if expect != got:
-                if teardown_blk:
-                    teardown_blk.filter(env)
-                srv.stop()
-                return not_match(expect, got)
+                # try re match
+                fail = True
+                try:
+                    pat = re.compile('^%s$' % expect)
+                    if pat.match(got):
+                        fail = False
+                except sre_constants.error:
+                    pass
+                if fail:
+                    if teardown_blk:
+                        teardown_blk.filter(env)
+                    srv.stop()
+                    return not_match(expect, got)
 
     if teardown_blk:
         teardown_blk.filter(env)
 
     srv.stop()
 
-    err = _check_log('error') or _check_log('warn')
+    err = _check_log('error', force=True)
+    if err:
+        return err
+    err = _check_log('warn')
     if err:
         return err
 
 
+def shuffle_cases(cases):
+    indexes = range(len(cases))
+    series = defaultdict(list)
+    single = []
+    for case in cases:
+        se = case.series
+        if se is not None:
+            series[se].append(case)
+        else:
+            single.append(case)
+
+    randed = []
+    series_items = series.items()
+    random.shuffle(series_items)
+    for se, cas in series_items:
+        pos = sorted(random.sample(indexes, len(cas)))
+        for p, c in zip(pos, cas):
+            randed.append((p, c))
+            indexes.remove(p)
+    random.shuffle(indexes)
+    for p, c in zip(indexes, single):
+        randed.append((p, c))
+    return [c for _, c in sorted(randed)]
+
+
 def main():
     parser = OptionParser()
-    parser.add_option("-k", "--filter", dest="filter",
-                      help="file pattern to run")
+    parser.add_option('-k', '--filter', dest='filter',
+            help='file pattern to run')
+    parser.add_option('-d', action='store_true', dest='debug',
+            help='print request and response')
+    parser.add_option('-r', action='store_true', dest='random',
+            help='run test cases in random order')
+    parser.add_option('-n', action='store_true', dest='name',
+            help='print test case names')
     options, args = parser.parse_args()
 
     test_dir = args[0] if args else 'tests'
@@ -359,18 +462,40 @@ def main():
 
     failed_cases = []
     for fpath, (file_env, cases) in test_cases:
+        if options.random or file_env.get('RANDOM', False):
+            cases = shuffle_cases(cases)
+
+        if cases and options.name:
+            for c in cases:
+                info(c.name)
+            info('\n')
+
         case_num = len(cases)
         num_width = len(str(case_num))
         info('%s\t...............\t0/%s%s' % \
                 (fpath, case_num, '\b' * (num_width + 2)), end='')
+
+        series_env = {}
 
         for idx, case in enumerate(cases):
             back_wdith = num_width + 1 + len(str(idx + 1))
             info('%s/%s%s' % (idx + 1, case_num, '\b' * back_wdith),
                     end='')
 
-            time.sleep(0.1)
-            case_env = copy.copy(file_env)
+            # prepare env for test series
+            series = case.series
+            if series is not None:
+                if series in series_env:
+                    case_env = series_env[series]
+                else:
+                    case_env = copy.copy(file_env)
+                    series_env[series] = case_env
+            else:
+                case_env = copy.copy(file_env)
+
+            if options.debug:
+                case_env['DEBUG'] = True
+
             try:
                 err = run_case(case_env, case)
                 if err:
@@ -383,10 +508,12 @@ def main():
     info('=' * 50)
     if not failed_cases:
         info('all test case(s) passed.')
+        exit(0)
     else:
         error('%s/%s test case(s) failed.' % (len(failed_cases), total_cases))
         for fpath, name, err in failed_cases:
             error('%s:%s, %s' % (fpath, name, err))
+        exit(1)
 
 
 if __name__ == '__main__':
