@@ -42,23 +42,12 @@ class ParseError(Exception):
 def http_wrap(s, unused):
     parts = s.split('\n')
     i = next((i for i, v in enumerate(parts) if v == ''), len(parts))
-    header = '\r\n'.join(l for l in parts[:i])
     body = '\n'.join(l for l in parts[i+1:])
+    hh = parts[:i]
+    if not any(l.split(':', 1)[0].title() == 'Content-Length' for l in hh):
+        hh.append('Content-Length: %s' % len(body))
+    header = '\r\n'.join(l for l in hh)
     return '%s\r\n\r\n%s' % (header, body)
-
-
-def http_strip_body(s, unused):
-    sep = s.find('\r\n\r\n')
-    if sep > 0:
-        s = s[:sep]
-    return s.split('\r\n')
-
-
-def http_strip_header(s, unused):
-    sep = s.find('\r\n\r\n')
-    if not sep:
-        return s
-    return s[sep+4:]
 
 
 def python_exec(s, e):
@@ -71,15 +60,11 @@ class Block(object):
 
     FILTERS = {
         'http': http_wrap,
-        'http_strip_body': http_strip_body,
-        'http_strip_header': http_strip_header,
         'python': python_exec,
     }
 
     DEFAULT_FILTER = {
         'request': 'http',
-        'response': 'http_strip_body',
-        'response_body': 'http_strip_header',
         'setup': 'python',
         'teardown': 'python',
     }
@@ -102,7 +87,9 @@ class Block(object):
         while i <= j and lines[j].strip() == '':
             j -= 1
 
-        self.raw_lines = [l.rstrip() for l in lines[i:j+1]]
+        self.raw_lines = [re.sub('\\\\r$', '\r', l.rstrip())
+                for l in lines[i:j+1]]
+
         if self.raw_lines and self.raw_lines[-1] == '__EOF__':
             self.raw_lines[-1] = ''
 
@@ -119,6 +106,12 @@ class Block(object):
     def raw_content(self):
         return '\n'.join(self.raw_lines)
 
+    @classmethod
+    def evaluate(cls, env, content):
+        return cls.EVAL_RE.sub(
+                    lambda m: str(eval(m.groups()[0], None, env)),
+                    content)
+
     def lines(self, env):
         t = [self.EVAL_RE.sub(
                     lambda m: str(eval(m.groups()[0], None, env)),
@@ -126,15 +119,10 @@ class Block(object):
         return t
 
     def content(self, env):
-        return self.EVAL_RE.sub(
-                    lambda m: str(eval(m.groups()[0], None, env)),
-                    self.raw_content)
+        return self.evaluate(env, self.raw_content)
 
     def filter(self, env, raw_content=None):
-        content = self.raw_content if raw_content is None else raw_content
-        content = self.EVAL_RE.sub(
-                    lambda m: str(eval(m.groups()[0], None, env)),
-                    content)
+        content = raw_content if raw_content else self.content(env)
         for flt in self.filters:
             if flt == 'raw':
                 continue
@@ -309,16 +297,36 @@ def do_http_request(endpoint, body, timeout=5):
     headers = ('%s: %s' % (k.title(), v) for k, v in resp.getheaders())
     data.extend(headers)
     data.append('')
-    body = resp.read()
+    resp_body = resp.read()
     conn.close()
-    if body:
-        data.append(body)
+    if resp_body:
+        data.append(resp_body)
     return '\r\n'.join(data)
 
 
-def run_case(env, case):
-    srv = Server(env)
-    not_match = lambda exp, got: 'expect %r but got %r' % (exp, got)
+class NotMatch(object):
+    def __init__(self, exp, got, title=None):
+        self.exp = exp
+        self.got = got
+        self.title = title
+
+    def __str__(self):
+        ss = []
+        if self.title:
+            ss.append('\033[95m%s\033[0m' % self.title)
+        ss.extend([
+            '\033[95mexpect:\033[0m',
+            '\033[92m%s\033[0m' % self.exp,
+            '\033[95mbut got:\033[0m',
+            '\033[92m%s\033[0m' % self.got,
+        ])
+        return '\n'.join(ss)
+
+    def __repr__(self):
+        return self.__str__()
+
+
+def run_case(srv, env, case):
     def _check_log(level, force=False):
         err_prefix = 'grep %s failed, ' % level
 
@@ -327,18 +335,16 @@ def run_case(env, case):
         blk = case.get_block(level)
         if not blk:
             if force and log_lines:
-                return err_prefix + not_match([], log_lines)
+                return NotMatch([], log_lines, err_prefix)
             return
 
         lines = [l for l in blk.lines(env) if l.strip()]
 
         if len(lines) != len(log_lines):
-            return err_prefix + not_match(lines, log_lines)
+            return NotMatch(lines, log_lines, err_prefix)
         for idx, line in enumerate(lines):
             if not re.match(line, log_lines[idx]):
-                return err_prefix + not_match(line, log_lines[idx])
-
-    srv.start()
+                return NotMatch(line, log_lines[idx], err_prefix)
 
     setup_blk = case.get_block('setup')
     if setup_blk:
@@ -350,8 +356,9 @@ def run_case(env, case):
     if request_blk:
         content = request_blk.filter(env)
         endpoint = env.get('ENDPOINT', '127.0.0.1')
+        timeout = env.get('TIMEOUT', 5)
 
-        resp = do_http_request(endpoint, content)
+        resp = do_http_request(endpoint, content, timeout=timeout)
 
         if env.get('DEBUG', False):
             info('request %s' % ('-' * 50))
@@ -366,7 +373,9 @@ def run_case(env, case):
                 info('expect %s' % ('-' * 50))
                 info('\n'.join(expect))
 
-            got = response_blk.filter(env, resp)
+            sep = resp.find('\r\n\r\n')
+            resp_headers = resp[:sep] if sep > 0 else resp
+            got = response_blk.filter(env, resp_headers).split('\r\n')
 
             for line in expect:
                 if line in got:
@@ -380,12 +389,15 @@ def run_case(env, case):
                     pass
                 if teardown_blk:
                     teardown_blk.filter(env)
-                srv.stop()
-                return not_match('\n'.join(expect), '\n'.join(got))
+                return NotMatch('\n'.join(expect), '\n'.join(got))
         response_body_blk = case.get_block('response_body')
         if response_body_blk:
             expect = response_body_blk.content(env)
-            got = response_body_blk.filter(env, resp)
+
+            sep = resp.find('\r\n\r\n')
+            resp_body = resp if sep < 0 else resp[sep+4:]
+            got = response_body_blk.filter(env, resp_body)
+
             if expect != got:
                 # try re match
                 fail = True
@@ -398,13 +410,10 @@ def run_case(env, case):
                 if fail:
                     if teardown_blk:
                         teardown_blk.filter(env)
-                    srv.stop()
-                    return not_match(expect, got)
+                    return NotMatch(expect, got)
 
     if teardown_blk:
         teardown_blk.filter(env)
-
-    srv.stop()
 
     err = _check_log('error', force=True)
     if err:
@@ -452,7 +461,7 @@ def main():
     options, args = parser.parse_args()
 
     test_dir = args[0] if args else 'tests'
-    sys.path.append(test_dir)
+    sys.path.append(test_dir.split(os.path.sep)[0])
 
     test_files = gather_files(test_dir)
     test_cases = gather_cases(test_files, options.filter)
@@ -496,15 +505,19 @@ def main():
             if options.debug:
                 case_env['DEBUG'] = True
 
+            srv = Server(case_env)
+            srv.start()
             try:
-                err = run_case(case_env, case)
+                err = run_case(srv, case_env, case)
                 if err:
                     error('%s:%s, %s' % (fpath, case.name, err))
                     failed_cases.append((fpath, case.name, err))
             except Exception as e:
                 error(str(e))
                 failed_cases.append((fpath, case.name, str(e)))
-        info('\n')
+            finally:
+                srv.stop()
+        info('\n', end='')
     info('=' * 50)
     if not failed_cases:
         info('all test case(s) passed.')
