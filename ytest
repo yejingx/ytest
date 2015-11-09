@@ -10,10 +10,14 @@ import re
 import copy
 import random
 import httplib
+import json
+import traceback
 import sre_constants
 from collections import defaultdict
 from optparse import OptionParser
 
+
+EXEC_LINE_RE = re.compile('File "<string>", line (\d+)')
 
 def error(s, **kw):
     print('\033[91m%s\033[0m' % s, **kw)
@@ -326,6 +330,47 @@ class NotMatch(object):
         return self.__str__()
 
 
+class ExecError(object):
+    def __init__(self, err, lineno, exc):
+        self.err = err
+        self.lineno = lineno
+        self.exc = exc
+
+    def __str__(self):
+        return '\033[95m%s in line %s: %s\033[0m' \
+            % (self.err, self.lineno, self.exc)
+
+    def __repr__(self):
+        return self.__str__()
+
+
+def re_match(expect, got):
+    try:
+        pat = re.compile('^%s$' % expect)
+        if pat.match(got):
+            return True
+    except sre_constants.error:
+        pass
+    return False
+
+
+class ResponseObj(object):
+    def __init__(self, headers, body):
+        self.headers = {}
+        headers = headers.split('\r\n')
+        for h in headers:
+            hh = h.split(':', 1)
+            if len(hh) == 2:
+                self.headers[hh[0].strip()] = hh[1].strip()
+            else:
+                self.headers[h] = ''
+        self.body = body
+        try:
+            self.json = json.loads(body)
+        except:
+            self.json = {}
+
+
 def run_case(srv, env, case):
     def _check_log(level, force=False):
         err_prefix = 'grep %s failed, ' % level
@@ -366,16 +411,19 @@ def run_case(srv, env, case):
             info('response %s' % ('-' * 50))
             info(resp)
 
+        sep = resp.find('\r\n\r\n')
+        resp_headers = resp[:sep] if sep > 0 else resp
+        resp_body = resp if sep < 0 else resp[sep+4:]
+
+        env['__resp'] = ResponseObj(resp_headers, resp_body)
+
         response_blk = case.get_block('response')
         if response_blk:
             expect = [l.strip() for l in response_blk.lines(env)]
+            got = response_blk.filter(env, resp_headers).split('\r\n')
             if env.get('DEBUG', False):
                 info('expect %s' % ('-' * 50))
                 info('\n'.join(expect))
-
-            sep = resp.find('\r\n\r\n')
-            resp_headers = resp[:sep] if sep > 0 else resp
-            got = response_blk.filter(env, resp_headers).split('\r\n')
 
             for line in expect:
                 if line in got:
@@ -393,24 +441,36 @@ def run_case(srv, env, case):
         response_body_blk = case.get_block('response_body')
         if response_body_blk:
             expect = response_body_blk.content(env)
-
-            sep = resp.find('\r\n\r\n')
-            resp_body = resp if sep < 0 else resp[sep+4:]
             got = response_body_blk.filter(env, resp_body)
 
             if expect != got:
-                # try re match
-                fail = True
-                try:
-                    pat = re.compile('^%s$' % expect)
-                    if pat.match(got):
-                        fail = False
-                except sre_constants.error:
-                    pass
-                if fail:
-                    if teardown_blk:
-                        teardown_blk.filter(env)
-                    return NotMatch(expect, got)
+                if teardown_blk:
+                    teardown_blk.filter(env)
+                return NotMatch(expect, got)
+
+        response_match_blk = case.get_block('response_match')
+        if response_match_blk:
+            expect = response_match_blk.content(env)
+            got = response_match_blk.filter(env, resp_body)
+            if not re_match(expect, got):
+                if teardown_blk:
+                    teardown_blk.filter(env)
+                return NotMatch(expect, got)
+
+        response_eval_blk = case.get_block('response_eval')
+        if response_eval_blk:
+            expect = response_eval_blk.content(env)
+            try:
+                exec(expect, None, env)
+            except Exception as e:
+                if teardown_blk:
+                    teardown_blk.filter(env)
+                lineno = EXEC_LINE_RE.findall(traceback.format_exc())
+                if lineno and lineno[0].isdigit() and int(lineno[0]) > 0:
+                    lineno = int(lineno[0])
+                    exc = expect.split('\n')[lineno - 1]
+                    return ExecError(type(e), lineno, exc)
+                return ExecError(type(e), 'unknown', expect)
 
     if teardown_blk:
         teardown_blk.filter(env)
@@ -504,6 +564,9 @@ def main():
 
             if options.debug:
                 case_env['DEBUG'] = True
+
+            if '__resp' in case_env:
+                case_env['__last_resp'] = case_env.pop('__resp')
 
             srv = Server(case_env)
             srv.start()
