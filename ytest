@@ -17,6 +17,9 @@ from collections import defaultdict
 from optparse import OptionParser
 
 
+def _exec(s, g, e):
+    exec(s, g, e)
+
 EXEC_LINE_RE = re.compile('File "<string>", line (\d+)')
 
 def error(s, **kw):
@@ -55,7 +58,7 @@ def http_wrap(s, unused):
 
 
 def python_exec(s, e):
-    exec(s, None, e)
+    _exec(s, None, e)
     return s
 
 
@@ -236,7 +239,7 @@ def gather_cases(test_files, filter=None):
         try:
             env_lines, cases = parse_file(fpath)
             if env_lines:
-                exec(''.join(env_lines), None, env)
+                _exec(''.join(env_lines), None, env)
         except ParseError as e:
             warn('ParseError in %s:%s, invalid line: %s' % \
                     (e.fpath, e.line_no, e.line))
@@ -413,7 +416,7 @@ def run_case(srv, env, case):
 
         sep = resp.find('\r\n\r\n')
         resp_headers = resp[:sep] if sep > 0 else resp
-        resp_body = resp if sep < 0 else resp[sep+4:]
+        resp_body = '' if sep < 0 else resp[sep+4:]
 
         env['__resp'] = ResponseObj(resp_headers, resp_body)
 
@@ -461,7 +464,7 @@ def run_case(srv, env, case):
         if response_eval_blk:
             expect = response_eval_blk.content(env)
             try:
-                exec(expect, None, env)
+                _exec(expect, None, env)
             except Exception as e:
                 if teardown_blk:
                     teardown_blk.filter(env)
